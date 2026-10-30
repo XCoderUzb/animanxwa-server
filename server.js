@@ -11,7 +11,7 @@ const verify = t => { try { const [b, s] = String(t).split("."); const e = crypt
   const o = JSON.parse(Buffer.from(b, "base64url")); return o.exp > Date.now() ? o : null; } catch (e) { return null; } };
 const same = (a, b) => crypto.timingSafeEqual(crypto.createHash("sha256").update(String(a)).digest(), crypto.createHash("sha256").update(String(b)).digest());
 const adm = lvl => (q, r, n) => { const t = verify((q.headers.authorization || "").replace(/^Bearer /, "")); if (!t || t.lvl < lvl) return r.status(401).json({ error: "Ruxsat yo'q" }); n(); };
-const wrap = f => (q, r) => f(q, r).catch(e => { console.error(e); r.status(500).json({ error: "Server xatosi" }); });
+const wrap = f => (q, r) => f(q, r).catch(e => { console.error(q.method, q.path, e); r.status(500).json({ error: "Server xatosi" + (q.headers.authorization ? ": " + String(e.message).slice(0, 160) : "") }); });
 const str = (v, n) => String(v == null ? "" : v).slice(0, n), num = v => Number.isFinite(+v) ? +v : 0;
 const list = (a, n) => (Array.isArray(a) ? a : []).slice(0, 30).map(x => str(x, n));
 const clean = b => ({ title: str(b.title, 120), desc: str(b.desc, 4000), author: str(b.author, 120), studio: str(b.studio, 120), year: num(b.year),
@@ -61,7 +61,9 @@ app.post("/api/admin/baza", adm(2), wrap(async (q, r) => {
 app.delete("/api/admin/baza/:i", adm(2), wrap(async (q, r) => { const l = await bz(); l.splice(+q.params.i, 1); await C.updateOne({ _id: "baza" }, { $set: { list: l } }, { upsert: true }); r.json({ list: l }); }));
 
 app.use((e, q, r, n) => r.status(400).json({ error: "Noto'g'ri so'rov" }));
-MongoClient.connect(MONGODB_URI).then(c => {
+MongoClient.connect(MONGODB_URI).then(async c => {
   const d = c.db("animanxwa"); M = d.collection("manga"); P = d.collection("pages"); C = d.collection("cfg");
+  try { await C.updateOne({ _id: "sinov" }, { $set: { t: Date.now() } }, { upsert: true }); await C.deleteOne({ _id: "sinov" }); console.log("MongoDB yozish sinovi: OK"); }
+  catch (e) { console.error("MongoDB yozish sinovi XATO. Atlas > Database Access > foydalanuvchiga 'Read and write to any database' huquqini bering:", e.message); }
   app.listen(process.env.PORT || 3000, () => console.log("Server tayyor"));
 }).catch(e => { console.error("MongoDB ga ulanib bo'lmadi:", e.message); process.exit(1); });
