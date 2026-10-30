@@ -65,5 +65,6 @@ MongoClient.connect(MONGODB_URI).then(async c => {
   const d = c.db("animanxwa"); M = d.collection("manga"); P = d.collection("pages"); C = d.collection("cfg");
   try { await C.updateOne({ _id: "sinov" }, { $set: { t: Date.now() } }, { upsert: true }); await C.deleteOne({ _id: "sinov" }); console.log("MongoDB yozish sinovi: OK"); }
   catch (e) { console.error("MongoDB yozish sinovi XATO. Atlas > Database Access > foydalanuvchiga 'Read and write to any database' huquqini bering:", e.message); }
+  try { require("./bot")({ app, M, P, bz }); } catch (e) { console.error("Bot yuklanmadi (API ishlayveradi):", e.message); }
   app.listen(process.env.PORT || 3000, () => console.log("Server tayyor"));
 }).catch(e => { console.error("MongoDB ga ulanib bo'lmadi:", e.message); process.exit(1); });
