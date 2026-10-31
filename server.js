@@ -3,7 +3,7 @@ const { MONGODB_URI, ADMIN_PASS_1, ADMIN_PASS_2 } = process.env;
 if (!MONGODB_URI || !ADMIN_PASS_1 || !ADMIN_PASS_2) { console.error("MONGODB_URI, ADMIN_PASS_1 va ADMIN_PASS_2 kerak"); process.exit(1); }
 const SECRET = process.env.SESSION_SECRET || crypto.createHash("sha256").update(MONGODB_URI + ADMIN_PASS_2).digest("hex");
 const app = express(); app.disable("x-powered-by"); app.set("trust proxy", 1); app.use(cors()); app.use(express.json({ limit: "2mb" }));
-let M, P, C, N, D; // manga, pages, cfg, bildirishnomalar, qurilmalar
+let M, P, C, N, D, R; // manga, pages, cfg, bildirishnomalar, qurilmalar, baholar
 
 const sign = o => { const b = Buffer.from(JSON.stringify(o)).toString("base64url"); return b + "." + crypto.createHmac("sha256", SECRET).update(b).digest("base64url"); };
 const verify = t => { try { const [b, s] = String(t).split("."); const e = crypto.createHmac("sha256", SECRET).update(b).digest("base64url");
@@ -51,6 +51,36 @@ app.post("/api/admin/manga/:id/chapter", adm(1), wrap(async (q, r) => {
   await P.insertOne({ _id: cid, mid, pages }); notifyChapter(await M.findOne({ _id: mid }), ch); r.json({ id: cid });
 }));
 
+// --- bob tahrirlash/o'chirish, ko'rilgan, yoqtirish, reyting ---
+app.put("/api/admin/manga/:id/chapter/:cid", adm(1), wrap(async (q, r) => {
+  const mid = +q.params.id, cid = +q.params.cid, b = q.body || {}, set = {};
+  if (b.num !== undefined) set["chapters.$.num"] = num(b.num);
+  if (b.vol !== undefined) set["chapters.$.vol"] = num(b.vol);
+  if (b.season !== undefined) set["chapters.$.season"] = num(b.season);
+  if (b.title !== undefined) set["chapters.$.title"] = str(b.title, 120);
+  if (Object.keys(set).length) { const u = await M.updateOne({ _id: mid, "chapters.id": cid }, { $set: set }); if (!u.matchedCount) return r.status(404).json({ error: "Bob topilmadi" }); }
+  if (Array.isArray(b.pages)) {
+    const pages = b.pages.slice(0, 2000).map(p => ({ u: str(p.u || p, 500), w: num(p.w), h: num(p.h) }));
+    if (!pages.length) return r.status(400).json({ error: "Sahifalar yo'q" });
+    await P.updateOne({ _id: cid }, { $set: { pages, mid } }, { upsert: true });
+  }
+  r.json({ ok: 1 });
+}));
+app.delete("/api/admin/manga/:id/chapter/:cid", adm(1), wrap(async (q, r) => {
+  const mid = +q.params.id, cid = +q.params.cid, mg = await M.findOne({ _id: mid }), ch = mg && (mg.chapters || []).find(c => c.id == cid);
+  await M.updateOne({ _id: mid }, { $pull: { chapters: { id: cid } } }); await P.deleteOne({ _id: cid });
+  if (ch) await N.deleteMany({ mid, num: ch.num, kind: "chap" }); r.json({ ok: 1 });
+}));
+app.post("/api/read/:id/:cid", wrap(async (q, r) => { await M.updateOne({ _id: +q.params.id, "chapters.id": +q.params.cid }, { $inc: { reads: 1, "chapters.$.views": 1 } }); r.json({ ok: 1 }); }));
+app.post("/api/like/:id/:cid", wrap(async (q, r) => { const d = (q.body || {}).d == -1 ? -1 : 1; await M.updateOne({ _id: +q.params.id, "chapters.id": +q.params.cid }, { $inc: { "chapters.$.likes": d } }); r.json({ ok: 1 }); }));
+app.post("/api/rate/:id", wrap(async (q, r) => {
+  const id = +q.params.id, b = q.body || {}, uid = str(b.uid, 40), v = Math.min(10, Math.max(1, num(b.v)));
+  if (!/^\d{10,40}$/.test(uid)) return r.status(400).json({ error: "uid" });
+  await R.updateOne({ _id: id + ":" + uid }, { $set: { mid: id, v } }, { upsert: true });
+  const a = (await R.aggregate([{ $match: { mid: id } }, { $group: { _id: null, avg: { $avg: "$v" }, n: { $sum: 1 } } }]).toArray())[0] || { avg: 0, n: 0 };
+  await M.updateOne({ _id: id }, { $set: { rating: Math.round(a.avg * 10) / 10, rc: a.n } }); r.json({ rating: a.avg, rc: a.n });
+}));
+
 // --- baza (Cloudinary): ko'rish 1-darajadan, qo'shish/o'chirish faqat 2-darajadan ---
 app.get("/api/admin/baza", adm(1), wrap(async (q, r) => r.json({ list: await bz() })));
 app.post("/api/admin/baza", adm(2), wrap(async (q, r) => {
@@ -81,7 +111,7 @@ app.post("/api/admin/notify", adm(1), wrap(async (q, r) => {
 
 app.use((e, q, r, n) => r.status(400).json({ error: "Noto'g'ri so'rov" }));
 MongoClient.connect(MONGODB_URI).then(async c => {
-  const d = c.db("animanxwa"); M = d.collection("manga"); P = d.collection("pages"); C = d.collection("cfg"); N = d.collection("notif"); D = d.collection("dev");
+  const d = c.db("animanxwa"); M = d.collection("manga"); P = d.collection("pages"); C = d.collection("cfg"); N = d.collection("notif"); D = d.collection("dev"); R = d.collection("rates");
   try { await C.updateOne({ _id: "sinov" }, { $set: { t: Date.now() } }, { upsert: true }); await C.deleteOne({ _id: "sinov" }); console.log("MongoDB yozish sinovi: OK"); }
   catch (e) { console.error("MongoDB yozish sinovi XATO. Atlas > Database Access > foydalanuvchiga 'Read and write to any database' huquqini bering:", e.message); }
   try { require("./bot")({ app, M, P, bz, notifyChapter }); } catch (e) { console.error("Bot yuklanmadi (API ishlayveradi):", e.message); }
