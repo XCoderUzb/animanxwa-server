@@ -1,8 +1,9 @@
 // Telegram bot: manga boblarini yuklash. Webhook orqali, Render'dagi shu xizmatning ichida ishlaydi.
 const fs = require("fs"), os = require("os"), path = require("path"), crypto = require("crypto"), sharp = require("sharp");
+const { Readable } = require("stream"), { pipeline } = require("stream/promises");
 sharp.cache(false); sharp.concurrency(1);
 
-module.exports = function ({ app, M, P, bz }) {
+module.exports = function ({ app, M, P, bz, notifyChapter }) {
   const TOKEN = process.env.BOT_TOKEN;
   if (!TOKEN) return console.log("BOT_TOKEN yo'q: Telegram bot o'chirilgan");
   const ADMINS = new Set((process.env.TG_ADMINS || "").split(",").map(s => s.trim()).filter(Boolean));
@@ -54,14 +55,14 @@ module.exports = function ({ app, M, P, bz }) {
     }
     return e;
   }
-  async function slices(src) {
+  async function slices(src, cut) {
     const meta = await sharp(src, { failOn: "none" }).metadata(), sw = meta.orientation >= 5 ? meta.height : meta.width, sh = meta.orientation >= 5 ? meta.width : meta.height;
     if (!sw || !sh) throw Error("rasm emas");
     const tw = Math.min(sw, MAXW), th = Math.round(sh * tw / sw);
     const base = () => sharp(src, { failOn: "none" }).rotate().resize({ width: tw, height: th, fit: "fill" });
     const out = []; let y = 0;
     while (y < th) {
-      let e = Math.min(th, y + CUT); if (e < th) e = await cutAt(base, tw, y, e);
+      let e = Math.min(th, y + (cut ? CUT : 15000)); if (e < th) e = await cutAt(base, tw, y, e);
       const h = e - y; let b;
       for (const q of [82, 70, 55]) { b = await base().extract({ left: 0, top: y, width: tw, height: h }).webp({ quality: q, effort: 3 }).toBuffer(); if (b.length < 7e5) break; }
       out.push({ buf: b, w: tw, h }); y = e;
@@ -73,16 +74,53 @@ module.exports = function ({ app, M, P, bz }) {
     if (!r.ok) throw Error("faylni yuklab bo'lmadi");
     return Buffer.from(await r.arrayBuffer());
   }
+  const DRIVE = /drive\.google\.com\/(?:file\/d\/|open\?id=|uc\?[^\s]*?id=)([\w-]{20,})/gi;
+  async function driveGet(did, dest) { // Google Drive (Havolasi bor har kim) dan yuklab olish, 20 MB cheklovi yo'q
+    let url = `https://drive.usercontent.google.com/download?id=${did}&export=download&confirm=t`;
+    for (let t = 0; t < 3; t++) {
+      const r = await fetch(url, { redirect: "follow" });
+      if (!r.ok) throw Error("Drive xatosi " + r.status);
+      if (!/text\/html/i.test(r.headers.get("content-type") || "")) return pipeline(Readable.fromWeb(r.body), fs.createWriteStream(dest));
+      const h = await r.text(), f = [...h.matchAll(/name="(id|export|confirm|uuid|authuser)" value="([^"]*)"/g)];
+      if (!f.length) throw Error("Drive fayl ochiq emas yoki limit tugagan: «Havolasi bor har kim» ruxsatini bering");
+      url = "https://drive.usercontent.google.com/download?" + f.map(m => m[1] + "=" + encodeURIComponent(m[2])).join("&");
+    }
+    throw Error("Drive'dan yuklab bo'lmadi");
+  }
+  function estScale(file) { // PDF sahifa o'lchamiga qarab render masshtabi (juda uzun sahifalar uchun ham)
+    const fd = fs.openSync(file, "r"), b = Buffer.alloc(4 << 20); let w = 0, h = 0, pos = 0, tail = "";
+    try {
+      for (;;) {
+        const n = fs.readSync(fd, b, 0, b.length, pos); if (!n) break; pos += n;
+        const t = tail + b.toString("latin1", 0, n);
+        for (const m of t.matchAll(/\/MediaBox\s*\[\s*([\d.\-]+)\s+([\d.\-]+)\s+([\d.\-]+)\s+([\d.\-]+)\s*\]/g)) { w = Math.max(w, m[3] - m[1]); h = Math.max(h, m[4] - m[2]); }
+        tail = t.slice(-200);
+      }
+    } finally { fs.closeSync(fd); }
+    if (!(w > 0 && h > 0)) return 1.5;
+    return Math.max(0.2, Math.min(MAXW / w, 3, Math.sqrt(14e6 / (w * h)), 30000 / h));
+  }
   async function prep(s, f) {
     s.dir = s.dir || fs.mkdtempSync(path.join(os.tmpdir(), "ax-"));
-    const buf = await dl(f.fid); f.out = [];
-    const add = async png => { for (const x of await slices(png)) { const p = path.join(s.dir, `${f.mid}-${f.out.length}.webp`); fs.writeFileSync(p, x.buf); f.out.push({ p, w: x.w, h: x.h, size: x.buf.length }); } };
-    if (f.kind != "pdf") return add(buf);
-    const tmp = path.join(s.dir, f.mid + ".pdf"); fs.writeFileSync(tmp, buf);
-    const { pdf } = await import("pdf-to-img"), doc = await pdf(tmp, { scale: 1.8 });
-    try { for await (const png of doc) await add(png); } finally { if (doc.destroy) await doc.destroy(); fs.rmSync(tmp, { force: true }); }
+    const cut = s.mg.type != "Manga"; f.out = []; // Manga turida sahifalar kesilmaydi
+    const add = async png => { for (const x of await slices(png, cut)) { const p = path.join(s.dir, `${f.mid}-${f.out.length}.webp`); fs.writeFileSync(p, x.buf); f.out.push({ p, w: x.w, h: x.h, size: x.buf.length }); } };
+    const file = path.join(s.dir, f.mid + ".src");
+    if (f.kind == "drive") await driveGet(f.did, file); else fs.writeFileSync(file, await dl(f.fid));
+    const fd = fs.openSync(file, "r"), hd = Buffer.alloc(5); fs.readSync(fd, hd, 0, 5, 0); fs.closeSync(fd);
+    if (hd.toString("latin1") != "%PDF-") {
+      if (hd[0] == 0x50 && hd[1] == 0x4b) throw Error("ZIP qo'llab-quvvatlanmaydi");
+      await add(fs.readFileSync(file)); return fs.rmSync(file, { force: true });
+    }
+    const pf = file + ".pdf"; fs.renameSync(file, pf);
+    const { pdf } = await import("pdf-to-img"); let sc = estScale(pf);
+    for (let t = 0; ; t++) {
+      const doc = await pdf(pf, { scale: sc });
+      try { for await (const png of doc) await add(png); break; }
+      catch (e) { if (t >= 4 || !/too big|invalid value|size/i.test(e.message)) throw e; f.out = []; sc = Math.max(0.2, sc * 0.7); }
+      finally { if (doc.destroy) await doc.destroy(); }
+    }
+    fs.rmSync(pf, { force: true });
   }
-
   // ---- fayl qabul qilish (yuborilgan tartibda ketma-ket tayyorlanadi) ----
   async function onFile(id, s, m) {
     if (s.step != "files") return say(id, s.step == "num" ? "Avval bob raqamini kiriting." : "Avval havola kiriting.");
@@ -90,17 +128,19 @@ module.exports = function ({ app, M, P, bz }) {
     if (m.photo) { const p = m.photo[m.photo.length - 1]; fid = p.file_id; size = p.file_size || 0; name = "foto"; kind = "img"; }
     else { const d = m.document, mt = d.mime_type || ""; fid = d.file_id; size = d.file_size || 0; name = d.file_name || "fayl"; kind = /pdf/i.test(mt) || /\.pdf$/i.test(name) ? "pdf" : /^image\//.test(mt) || /\.(jpe?g|png|webp)$/i.test(name) ? "img" : ""; }
     if (!kind) return say(id, "Bu fayl turi qo'llab-quvvatlanmaydi. PDF, JPG, PNG yoki WEBP yuboring.");
-    if (size > LIMIT) return say(id, `«${esc(name)}» 20 MB dan katta. Telegram botlarga bundan katta faylni yuklab olishga ruxsat bermaydi. Faylni kichraytiring yoki bo'lib yuboring.`);
-    const f = { mid: m.message_id, fid, name, kind, out: null };
+    if (size > LIMIT) return say(id, `«${esc(name)}» 20 MB dan katta. Telegram botlarga bundan katta faylni yuklab olishga ruxsat bermaydi. Faylni Google Drive'ga yuklab havolasini yuboring yoki bo'lib yuboring.`);
+    enqueue(id, s, { mid: m.message_id, fid, name, kind, out: null });
+  }
+  function enqueue(id, s, f) {
     s.files.push(f); s.pending++; clearTimeout(s.t);
-    s.q = s.q.then(() => prep(s, f)).catch(e => { console.error("prep:", e); f.out = null; s.errs.push(`${name}: ${e.message}`); s.files = s.files.filter(x => x !== f); })
+    s.q = s.q.then(() => prep(s, f)).catch(e => { console.error("prep:", e); f.out = null; s.errs.push(`${f.name}: ${e.message}`); s.files = s.files.filter(x => x !== f); })
       .then(() => { s.pending--; if (!s.pending) s.t = setTimeout(() => status(id, s), 2000); });
   }
   function status(id, s) {
     if (SS.get(id) !== s || s.pending || s.busy) return;
     const ok = s.files.filter(f => f.out), n = ok.reduce((a, f) => a + f.out.length, 0), mb = (ok.reduce((a, f) => a + f.out.reduce((b, x) => b + x.size, 0), 0) / 1048576).toFixed(1);
-    const errs = s.errs.splice(0);
-    say(id, `Tayyor ✓ ${ok.length} fayl → ${n} bo'lak (${mb} MB)` + (errs.length ? `\n⚠️ Xato: ${errs.map(esc).join("; ")}` : "") + "\nYana fayl yuborishingiz yoki saqlashingiz mumkin.", SAVEKB);
+    const errs = s.errs.splice(0), head = ok.length ? `Tayyor ✓ ${ok.length} fayl → ${n} bo'lak (${mb} MB)` : "Tayyor fayl yo'q";
+    say(id, head + (errs.length ? `\n⚠️ Xato: ${errs.map(esc).join("; ")}` : "") + (ok.length ? "\nYana fayl yuborishingiz yoki saqlashingiz mumkin." : "\nFaylni qayta yuboring yoki Google Drive havolasini tashlang."), ok.length ? SAVEKB : [[{ text: "Bekor ✕", callback_data: "cancel" }]]);
   }
 
   // ---- Cloudinary ga yuklash va bazaga yozish ----
@@ -143,6 +183,7 @@ module.exports = function ({ app, M, P, bz }) {
       const cid = Date.now();
       await P.insertOne({ _id: cid, mid: s.mg._id, pages: all.map((x, i) => ({ u: urls[i], w: x.w, h: x.h })) });
       await M.updateOne({ _id: s.mg._id }, { $push: { chapters: { id: cid, num: s.num, vol: 0, season: 0, title: "", at: cid } } });
+      if (notifyChapter) notifyChapter(s.mg, { num: s.num });
       const link = (SITE ? SITE + "/" : "animanxwa://") + `${s.mg.type.toLowerCase()}/${slug(s.mg.title) || s.mg._id}/${s.num}`;
       await say(id, `${esc(s.mg.title)} ga\n<b>${s.num}-bob yuklandi ✓</b>\nHavola: ${link}`);
       reset(id);
@@ -156,7 +197,7 @@ module.exports = function ({ app, M, P, bz }) {
     if (!isFinite(n) || n < 0) return say(id, "Raqam kiriting (masalan: 4).");
     if ((s.mg.chapters || []).some(c => c.num == n)) return say(id, `${n}-bob allaqachon mavjud. Boshqa raqam kiriting.`);
     s.num = n; s.step = "files";
-    return say(id, `<b>${esc(s.mg.title)}</b> — <b>${n}-bob</b>\nEndi PDF yoki rasmlarni yuboring (bir nechta fayl mumkin, yuborilgan tartibda qo'shiladi).\nSifat saqlansin desangiz rasmlarni «Fayl» (document) sifatida yuboring. Bittasi 20 MB gacha.`);
+    return say(id, `<b>${esc(s.mg.title)}</b> — <b>${n}-bob</b>\nEndi PDF yoki rasmlarni yuboring (bir nechta fayl mumkin, yuborilgan tartibda qo'shiladi).\nSifat saqlansin desangiz rasmlarni «Fayl» (document) sifatida yuboring. Telegram orqali bittasi 20 MB gacha; kattasi bo'lsa Google Drive havolasini yuboring («Havolasi bor har kim» ruxsati bilan).`);
   }
   async function handle(u) {
     if (u.callback_query) {
@@ -176,6 +217,11 @@ module.exports = function ({ app, M, P, bz }) {
     if (/^\/cancel/i.test(text)) { reset(id); return say(id, "Bekor qilindi. Havola kiriting."); }
     if (m.document || m.photo) return onFile(id, s, m);
     if (!text) return;
+    const dids = [...text.matchAll(DRIVE)].map(x => x[1]);
+    if (dids.length) {
+      if (s.step != "files") return say(id, s.step == "num" ? "Avval bob raqamini kiriting." : "Avval havola kiriting.");
+      return dids.forEach((d, i) => enqueue(id, s, { mid: m.message_id + i / 100, did: d, name: "Drive fayl", kind: "drive", out: null }));
+    }
     const mg = await findManga(text);
     if (mg) { wipe(s); SS.set(id, Object.assign(fresh(), { mg, step: "num" })); const f = info(mg); return say(id, f.text, [[{ text: "➕ " + f.next, callback_data: "num:" + f.next }]]); }
     if (/(manga|manhwa|manhua|novella)\/|[?&]s=/i.test(text)) return say(id, "Manga topilmadi. Havolani tekshiring.");
