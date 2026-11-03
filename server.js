@@ -91,14 +91,60 @@ app.post("/api/admin/baza", adm(2), wrap(async (q, r) => {
 app.delete("/api/admin/baza/:i", adm(2), wrap(async (q, r) => { const l = await bz(); l.splice(+q.params.i, 1); await C.updateOne({ _id: "baza" }, { $set: { list: l } }, { upsert: true }); r.json({ list: l }); }));
 
 // --- ilova versiyasi (eski versiyalarni to'xtatish) ---
-app.get("/api/version", wrap(async (q, r) => { const v = (await C.findOne({ _id: "app" })) || {}; r.json({ min: v.min || 0, url: v.url || "" }); }));
+app.get("/api/version", wrap(async (q, r) => { const v = (await C.findOne({ _id: "app" })) || {}; r.json({ min: v.min || 0, url: v.url || "", block: v.block !== false }); }));
 app.post("/api/admin/version", adm(2), wrap(async (q, r) => { const b = q.body || {}; await C.updateOne({ _id: "app" }, { $set: { min: num(b.min), url: str(b.url, 500) } }, { upsert: true }); r.json({ ok: 1 }); }));
 
+app.post("/api/admin/shield", adm(2), wrap(async (q, r) => { await C.updateOne({ _id: "app" }, { $set: { block: !!(q.body || {}).on } }, { upsert: true }); r.json({ ok: 1 }); }));
+
+// --- Push (Firebase Cloud Messaging, HTTP v1). FIREBASE_KEY = xizmat hisobi JSON fayli matni ---
+let FK = null; try { FK = JSON.parse(process.env.FIREBASE_KEY || ""); } catch (e) { if (process.env.FIREBASE_KEY) console.error("FIREBASE_KEY o'qilmadi (JSON emas)"); }
+const slug = t => String(t).toLowerCase().replace(/[ʻ'’‘`]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+let gtok = { v: "", exp: 0 };
+async function gtoken() {
+  if (gtok.v && Date.now() < gtok.exp - 6e4) return gtok.v;
+  const now = Math.floor(Date.now() / 1000), b64 = o => Buffer.from(JSON.stringify(o)).toString("base64url");
+  const head = b64({ alg: "RS256", typ: "JWT" }), claim = b64({ iss: FK.client_email, scope: "https://www.googleapis.com/auth/firebase.messaging", aud: "https://oauth2.googleapis.com/token", iat: now, exp: now + 3600 });
+  const sig = crypto.createSign("RSA-SHA256").update(head + "." + claim).sign(FK.private_key, "base64url");
+  const r = await fetch("https://oauth2.googleapis.com/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: "grant_type=" + encodeURIComponent("urn:ietf:params:oauth:grant-type:jwt-bearer") + "&assertion=" + head + "." + claim + "." + sig });
+  const j = await r.json(); if (!j.access_token) throw Error("Google token xatosi: " + (j.error_description || j.error));
+  gtok = { v: j.access_token, exp: Date.now() + j.expires_in * 1000 }; return gtok.v;
+}
+async function push(list, msg) {
+  const out = { ok: 0, err: [] };
+  if (!FK || !list.length) return out;
+  let at; try { at = await gtoken(); } catch (e) { out.err.push(e.message); console.error(e.message); return out; }
+  const url = `https://fcm.googleapis.com/v1/projects/${FK.project_id}/messages:send`;
+  for (let i = 0; i < list.length; i += 10) await Promise.all(list.slice(i, i + 10).map(async t => {
+    try {
+      const r = await fetch(url, { method: "POST", headers: { Authorization: "Bearer " + at, "Content-Type": "application/json" }, body: JSON.stringify({ message: { token: t.token, notification: { title: msg.title || "AniManxwa", body: msg.body || "", ...(msg.image ? { image: msg.image } : {}) }, data: { url: msg.url || "" }, android: { priority: "HIGH", notification: { channel_id: "default", color: "#e11d2e", icon: "ic_stat" } } } }) });
+      if (r.ok) return out.ok++;
+      const j = await r.json().catch(() => ({})), e = j.error || {};
+      out.err.push((e.status || r.status) + ": " + (e.message || ""));
+      if (e.status == "NOT_FOUND") D.updateOne({ _id: t._id }, { $unset: { token: "" } }).catch(() => {});
+    } catch (e) { out.err.push(e.message); }
+  }));
+  if (out.err.length) console.error("FCM xatolari:", out.err.slice(0, 3));
+  return out;
+}
+const pushAll = async msg => push(await D.find({ token: { $exists: true, $ne: "" } }).project({ token: 1 }).toArray(), msg);
+const pushSaved = async (mid, msg) => push(await D.find({ saved: mid, token: { $exists: true, $ne: "" } }).project({ token: 1 }).toArray(), msg);
+app.post("/api/admin/pushtest", adm(1), wrap(async (q, r) => {
+  if (!FK) return r.status(400).json({ error: "Render'da FIREBASE_KEY yozilmagan" });
+  const dv = await D.findOne({ _id: str((q.body || {}).uid, 40) });
+  if (!dv || !dv.token) return r.status(400).json({ error: "Bu telefonning tokeni serverga kelmagan: ruxsat berilganmi va ilova google-services.json bilan yig'ilganmi?" });
+  const res = await push([{ _id: dv._id, token: dv.token }], { title: "AniManxwa", body: "Sinov bildirishnomasi ✓" });
+  if (!res.ok) return r.status(500).json({ error: "FCM: " + (res.err[0] || "noma'lum xato") });
+  r.json({ ok: 1 });
+}));
+
 // --- bildirishnomalar: qo'lda (admin) va avtomatik (saqlangan mangaga yangi bob) ---
-const notifyChapter = (mg, ch) => N.insertOne({ at: Date.now(), kind: "chap", to: "saved", mid: mg._id, title: mg.title, type: mg.type, num: ch.num }).catch(e => console.error("notif:", e.message));
+const notifyChapter = (mg, ch) => {
+  N.insertOne({ at: Date.now(), kind: "chap", to: "saved", mid: mg._id, title: mg.title, type: mg.type, num: ch.num }).catch(e => console.error("notif:", e.message));
+  pushSaved(mg._id, { title: mg.title, body: `${mg.type}ni yangi bobi chiqdi · ${ch.num}-bob chiqdi ✓`, image: /^https?:/.test(mg.cover || "") ? mg.cover : "", url: `animanxwa://${mg.type.toLowerCase()}/${slug(mg.title) || mg._id}/${ch.num}` }).catch(e => console.error("push:", e.message));
+};
 app.post("/api/dev", wrap(async (q, r) => {
   const b = q.body || {}, id = str(b.uid, 40); if (!/^\d{10,40}$/.test(id)) return r.status(400).json({ error: "uid" });
-  await D.updateOne({ _id: id }, { $set: { saved: (Array.isArray(b.saved) ? b.saved : []).slice(0, 500).map(Number).filter(Number.isFinite), at: Date.now() } }, { upsert: true }); r.json({ ok: 1 });
+  await D.updateOne({ _id: id }, { $set: { saved: (Array.isArray(b.saved) ? b.saved : []).slice(0, 500).map(Number).filter(Number.isFinite), at: Date.now(), ...(typeof b.token == "string" && b.token.length > 20 ? { token: str(b.token, 400) } : {}) } }, { upsert: true }); r.json({ ok: 1 });
 }));
 app.get("/api/notif", wrap(async (q, r) => {
   const dv = await D.findOne({ _id: str(q.query.uid, 40) }), sv = dv ? dv.saved : [];
@@ -106,7 +152,8 @@ app.get("/api/notif", wrap(async (q, r) => {
 }));
 app.post("/api/admin/notify", adm(1), wrap(async (q, r) => {
   const b = q.body || {}; if (!str(b.title, 120).trim() && !str(b.body, 1000).trim()) return r.status(400).json({ error: "Matn yozing" });
-  await N.insertOne({ at: Date.now(), kind: "msg", to: "all", title: str(b.title, 120), body: str(b.body, 1000), image: str(b.image, 500), btn: b.btnText && b.btnUrl ? { t: str(b.btnText, 40), u: str(b.btnUrl, 500) } : null }); r.json({ ok: 1 });
+  await N.insertOne({ at: Date.now(), kind: "msg", to: "all", title: str(b.title, 120), body: str(b.body, 1000), image: str(b.image, 500), btn: b.btnText && b.btnUrl ? { t: str(b.btnText, 40), u: str(b.btnUrl, 500) } : null });
+  pushAll({ title: str(b.title, 120), body: str(b.body, 1000), image: /^https?:/.test(b.image || "") ? str(b.image, 500) : "", url: /^animanxwa:/i.test(b.btnUrl || "") ? str(b.btnUrl, 500) : "" }).catch(e => console.error("push:", e.message)); r.json({ ok: 1 });
 }));
 
 app.use((e, q, r, n) => r.status(400).json({ error: "Noto'g'ri so'rov" }));

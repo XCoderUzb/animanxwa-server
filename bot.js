@@ -9,7 +9,7 @@ module.exports = function ({ app, M, P, bz, notifyChapter }) {
   const ADMINS = new Set((process.env.TG_ADMINS || "").split(",").map(s => s.trim()).filter(Boolean));
   const SITE = (process.env.SITE_URL || "").replace(/\/+$/, "");
   const SECRET = crypto.createHash("sha256").update("tg" + TOKEN).digest("hex").slice(0, 32);
-  const API = "https://api.telegram.org/bot" + TOKEN, MAXW = 1080, CUT = 1800, LIMIT = 20 * 1024 * 1024;
+  const API = "https://api.telegram.org/bot" + TOKEN, MAXW = 1080, CUT = 1500, LIMIT = 20 * 1024 * 1024;
   const SS = new Map();
 
   const tg = async (m, b) => {
