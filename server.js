@@ -1,9 +1,9 @@
-const express = require("express"), cors = require("cors"), crypto = require("crypto"), { MongoClient } = require("mongodb");
+const express = require("express"), cors = require("cors"), crypto = require("crypto"), { MongoClient, ObjectId } = require("mongodb");
 const { MONGODB_URI, ADMIN_PASS_1, ADMIN_PASS_2 } = process.env;
 if (!MONGODB_URI || !ADMIN_PASS_1 || !ADMIN_PASS_2) { console.error("MONGODB_URI, ADMIN_PASS_1 va ADMIN_PASS_2 kerak"); process.exit(1); }
 const SECRET = process.env.SESSION_SECRET || crypto.createHash("sha256").update(MONGODB_URI + ADMIN_PASS_2).digest("hex");
 const app = express(); app.disable("x-powered-by"); app.set("trust proxy", 1); app.use(cors()); app.use(express.json({ limit: "2mb" }));
-let M, P, C, N, D, R; // manga, pages, cfg, bildirishnomalar, qurilmalar, baholar
+let M, P, C, N, D, R, A; // manga, pages, cfg, bildirishnomalar, qurilmalar, baholar
 
 const sign = o => { const b = Buffer.from(JSON.stringify(o)).toString("base64url"); return b + "." + crypto.createHmac("sha256", SECRET).update(b).digest("base64url"); };
 const verify = t => { try { const [b, s] = String(t).split("."); const e = crypto.createHmac("sha256", SECRET).update(b).digest("base64url");
@@ -94,6 +94,23 @@ app.delete("/api/admin/baza/:i", adm(2), wrap(async (q, r) => { const l = await 
 app.get("/api/version", wrap(async (q, r) => { const v = (await C.findOne({ _id: "app" })) || {}; r.json({ min: v.min || 0, url: v.url || "", block: v.block !== false }); }));
 app.post("/api/admin/version", adm(2), wrap(async (q, r) => { const b = q.body || {}; await C.updateOne({ _id: "app" }, { $set: { min: num(b.min), url: str(b.url, 500) } }, { upsert: true }); r.json({ ok: 1 }); }));
 
+// --- reklama va obuna (premium) ---
+const oid = s => { try { return new ObjectId(String(s)); } catch (e) { return null; } };
+app.get("/api/ads", wrap(async (q, r) => r.json((await A.find({ active: { $ne: false } }).sort({ at: -1 }).toArray()).map(a => ({ id: String(a._id), kind: a.kind, media: a.media, src: a.src, title: a.title, text: a.text, url: a.url })))));
+app.post("/api/ad/:id/:ev", wrap(async (q, r) => { const id = oid(q.params.id); if (id) await A.updateOne({ _id: id }, { $inc: { [q.params.ev == "click" ? "clicks" : "views"]: 1 } }); r.json({ ok: 1 }); }));
+app.get("/api/admin/ads", adm(1), wrap(async (q, r) => r.json((await A.find({}).sort({ at: -1 }).toArray()).map(a => ({ ...a, id: String(a._id), _id: undefined })))));
+app.post("/api/admin/ad", adm(1), wrap(async (q, r) => {
+  const b = q.body || {}; if (!/^https?:\/\//.test(b.src || "")) return r.status(400).json({ error: "Rasm yoki video kerak" });
+  await A.insertOne({ at: Date.now(), kind: b.kind == "full" ? "full" : "small", media: b.media == "video" ? "video" : "image", src: str(b.src, 500), title: str(b.title, 80), text: str(b.text, 160), url: str(b.url, 500), active: true, views: 0, clicks: 0 }); r.json({ ok: 1 });
+}));
+app.put("/api/admin/ad/:id", adm(1), wrap(async (q, r) => { const id = oid(q.params.id); if (id) await A.updateOne({ _id: id }, { $set: { active: !!(q.body || {}).active } }); r.json({ ok: 1 }); }));
+app.delete("/api/admin/ad/:id", adm(1), wrap(async (q, r) => { const id = oid(q.params.id); if (id) await A.deleteOne({ _id: id }); r.json({ ok: 1 }); }));
+app.get("/api/me", wrap(async (q, r) => { const d = await D.findOne({ _id: str(q.query.uid, 40) }); r.json({ premium: (d && d.premium) || 0 }); }));
+app.post("/api/admin/premium", adm(2), wrap(async (q, r) => {
+  const b = q.body || {}, id = str(b.uid, 40).replace(/\s/g, ""), days = Math.max(0, num(b.days)); if (!/^\d{10,40}$/.test(id)) return r.status(400).json({ error: "ID noto'g'ri" });
+  const d = await D.findOne({ _id: id }), from = Math.max(Date.now(), (d && d.premium) || 0);
+  await D.updateOne({ _id: id }, { $set: { premium: days ? from + days * 864e5 : 0 } }, { upsert: true }); r.json({ ok: 1 });
+}));
 app.post("/api/admin/shield", adm(2), wrap(async (q, r) => { await C.updateOne({ _id: "app" }, { $set: { block: !!(q.body || {}).on } }, { upsert: true }); r.json({ ok: 1 }); }));
 
 // --- Push (Firebase Cloud Messaging, HTTP v1). FIREBASE_KEY = xizmat hisobi JSON fayli matni ---
@@ -158,7 +175,7 @@ app.post("/api/admin/notify", adm(1), wrap(async (q, r) => {
 
 app.use((e, q, r, n) => r.status(400).json({ error: "Noto'g'ri so'rov" }));
 MongoClient.connect(MONGODB_URI).then(async c => {
-  const d = c.db("animanxwa"); M = d.collection("manga"); P = d.collection("pages"); C = d.collection("cfg"); N = d.collection("notif"); D = d.collection("dev"); R = d.collection("rates");
+  const d = c.db("animanxwa"); M = d.collection("manga"); P = d.collection("pages"); C = d.collection("cfg"); N = d.collection("notif"); D = d.collection("dev"); R = d.collection("rates"); A = d.collection("ads");
   try { await C.updateOne({ _id: "sinov" }, { $set: { t: Date.now() } }, { upsert: true }); await C.deleteOne({ _id: "sinov" }); console.log("MongoDB yozish sinovi: OK"); }
   catch (e) { console.error("MongoDB yozish sinovi XATO. Atlas > Database Access > foydalanuvchiga 'Read and write to any database' huquqini bering:", e.message); }
   try { require("./bot")({ app, M, P, bz, notifyChapter }); } catch (e) { console.error("Bot yuklanmadi (API ishlayveradi):", e.message); }
