@@ -148,13 +148,13 @@ module.exports = function ({ app, M, P, bz, notifyChapter }) {
   function enqueue(id, s, f) {
     f.chat = id; s.files.push(f); s.pending++; clearTimeout(s.t);
     say(id, `📥 «${esc(f.name)}» qabul qilindi${f.size ? ` (${(f.size / 1048576).toFixed(1)} MB)` : ""}. Navbatda: ${s.pending}`).then(r => { f.pm = r && r.message_id; });
-    s.q = s.q.then(() => prep(s, f)).catch(e => { console.error("prep:", e); f.out = null; s.errs.push(`${f.name}: ${e.message}`); s.files = s.files.filter(x => x !== f); note(f, `❌ «${esc(f.name)}»: ${esc(e.message)}`, true); })
+    s.q = s.q.then(() => prep(s, f)).catch(e => { console.error("prep:", e); f.out = null; s.errs.push(`${f.name}: ${e.message}`); s.files = s.files.filter(x => x !== f); if (s.multi) s.failed = true; note(f, `❌ «${esc(f.name)}»: ${esc(e.message)}`, true); })
       .then(() => { s.pending--; if (!s.pending) s.t = setTimeout(() => status(id, s), 2000); });
   }
   function status(id, s) {
     if (SS.get(id) !== s || s.pending || s.busy) return;
     const ok = s.files.filter(f => f.out), n = ok.reduce((a, f) => a + f.out.length, 0), mb = (ok.reduce((a, f) => a + f.out.reduce((b, x) => b + x.size, 0), 0) / 1048576).toFixed(1);
-    const errs = s.errs.splice(0), head = ok.length ? `Tayyor ✓ ${ok.length} fayl → ${n} bo'lak (${mb} MB)` : "Tayyor fayl yo'q";
+    const errs = s.errs.splice(0), head = (ok.length ? (s.multi ? `Tayyor ✓ ${ok.length} fayl = ${ok.length} bob (${s.num}-bobdan) · ${n} bo'lak (${mb} MB)` : `Tayyor ✓ ${ok.length} fayl → ${n} bo'lak (${mb} MB)`) : "Tayyor fayl yo'q") + (s.multi && s.failed ? "\n⚠️ Xatoli fayl bor: raqamlar siljimasligi uchun /cancel qilib qaytadan boshlang." : "");
     say(id, head + (errs.length ? `\n⚠️ Xato: ${errs.map(esc).join("; ")}` : "") + (ok.length ? "\nYana fayl yuborishingiz yoki saqlashingiz mumkin." : "\nFaylni qayta yuboring yoki Google Drive havolasini tashlang."), ok.length ? SAVEKB : [[{ text: "Bekor ✕", callback_data: "cancel" }]]);
   }
 
@@ -170,7 +170,34 @@ module.exports = function ({ app, M, P, bz, notifyChapter }) {
     }
     throw Error(err || "Baza qo'shilmagan");
   }
+  async function saveMulti(id, s) { // har bir fayl = alohida bob (num, num+1, ...)
+    const files = s.files.filter(f => f.out && f.out.length).sort((a, b) => a.mid - b.mid);
+    if (!files.length) return say(id, "Saqlash uchun tayyor fayl yo'q. Fayl yuboring.");
+    if (s.failed) return say(id, "⚠️ Xatoli fayl bor: raqamlar siljib ketmasligi uchun /cancel bilan bekor qilib, havolani qayta yuboring.");
+    files.forEach((f, i) => { if (f.n == null) f.n = s.num + i; });
+    const todo = files.filter(f => !f.done), done = [];
+    s.busy = true;
+    try {
+      const cur = await M.findOne({ _id: s.mg._id }); if (!cur) throw Error("Manga topilmadi");
+      const have = new Set((cur.chapters || []).map(c => c.num)); todo.forEach(f => { if (have.has(f.n)) throw Error(`${f.n}-bob allaqachon mavjud`); });
+      const bases = await bz(); if (!bases.length) throw Error("Baza yo'q: ilovada Admin paneli > Baza ga Cloudinary qo'shing");
+      for (const f of todo) {
+        const n = f.n, all = f.out, note = await say(id, `📤 ${n}-bob yuklanmoqda: 0/${all.length}`), urls = []; let k = 0, dn = 0, fail = null, last = 0;
+        const worker = async () => { while (k < all.length && !fail) { const j = k++; try { const buf = fs.readFileSync(all[j].p); let u, er; for (let t = 0; t < 3 && !u; t++) { try { u = await up(buf, bases); } catch (e) { er = e; } } if (!u) throw er; urls[j] = u; dn++; if (note && Date.now() - last > 3000) { last = Date.now(); edit(id, note.message_id, `📤 ${n}-bob yuklanmoqda: ${dn}/${all.length}`); } } catch (e) { fail = e; } } };
+        await Promise.all([worker(), worker(), worker()]); if (fail) throw fail;
+        const cid = Date.now();
+        await P.insertOne({ _id: cid, mid: s.mg._id, pages: all.map((x, j) => ({ u: urls[j], w: x.w, h: x.h })) });
+        await M.updateOne({ _id: s.mg._id }, { $push: { chapters: { id: cid, num: n, vol: 0, season: 0, title: "", at: cid } } });
+        if (notifyChapter) notifyChapter(s.mg, { num: n });
+        f.done = true; done.push(n); if (note) edit(id, note.message_id, `✓ ${n}-bob yuklandi (${all.length} bo'lak)`);
+      }
+      const link = (SITE ? SITE + "/" : "animanxwa://") + `${s.mg.type.toLowerCase()}/${slug(s.mg.title) || s.mg._id}/${done[0]}`;
+      await say(id, `${esc(s.mg.title)} ga\n<b>${done.length} ta bob yuklandi ✓</b> (${done[0]}–${done[done.length - 1]})\nHavola: ${link}`);
+      reset(id);
+    } catch (e) { s.busy = false; say(id, "Xato: " + esc(e.message) + (done.length ? `\nShu safar yuklangan boblar: ${done.join(", ")}. Qolganlarini «Saqlash ✓» bilan davom ettiring.` : "\nQayta urinish uchun «Saqlash ✓» ni bosing."), SAVEKB); }
+  }
   async function save(id, s) {
+    if (s.multi) return saveMulti(id, s);
     const all = s.files.filter(f => f.out).sort((a, b) => a.mid - b.mid).flatMap(f => f.out);
     if (!all.length) return say(id, "Saqlash uchun tayyor fayl yo'q. Fayl yuboring.");
     s.busy = true;
@@ -210,8 +237,9 @@ module.exports = function ({ app, M, P, bz, notifyChapter }) {
     if (!s.mg) return say(id, "Avval havola kiriting.");
     const n = parseFloat(String(t).replace(",", "."));
     if (!isFinite(n) || n < 0) return say(id, "Raqam kiriting (masalan: 4).");
-    if ((s.mg.chapters || []).some(c => c.num == n)) return say(id, `${n}-bob allaqachon mavjud. Boshqa raqam kiriting.`);
+    if (!s.multi && (s.mg.chapters || []).some(c => c.num == n)) return say(id, `${n}-bob allaqachon mavjud. Boshqa raqam kiriting.`);
     s.num = n; s.step = "files";
+    if (s.multi) return say(id, `📚 <b>${esc(s.mg.title)}</b> — ko'p bob rejimi: <b>${n}-bobdan</b> boshlanadi.\nEndi PDF fayllarni yuboring (yoki Drive havolalarini): har bir fayl alohida bob bo'ladi (1-fayl → ${n}-bob, 2-fayl → ${n + 1}-bob ...). Tugagach «Saqlash ✓» ni bosing.`);
     return say(id, `<b>${esc(s.mg.title)}</b> — <b>${n}-bob</b>\nEndi PDF yoki rasmlarni yuboring (bir nechta fayl mumkin, yuborilgan tartibda qo'shiladi).\nSifat saqlansin desangiz rasmlarni «Fayl» (document) sifatida yuboring. Telegram orqali bittasi 20 MB gacha; kattasi bo'lsa Google Drive havolasini yuboring («Havolasi bor har kim» ruxsati bilan).`);
   }
   async function handle(u) {
@@ -221,7 +249,8 @@ module.exports = function ({ app, M, P, bz, notifyChapter }) {
       const s = SS.get(id), d = q.data || ""; if (!s) return say(id, "Havola kiriting."); if (s.busy) return;
       if (d == "cancel") { reset(id); return say(id, "Bekor qilindi. Havola kiriting."); }
       if (d == "save") return s.pending ? say(id, "Hali tayyorlanmoqda, kuting...") : save(id, s);
-      if (d.startsWith("num:")) return setNum(id, s, d.slice(4));
+      if (d == "multi") { s.multi = true; s.step = "num"; return say(id, "📚 <b>Ko'p bob rejimi</b>\nBoshlang'ich bob raqamini kiriting (masalan: 1). Yuboradigan har bir PDF alohida bob bo'ladi: birinchi fayl shu raqamdan, keyingilari ketma-ket."); }
+      if (d.startsWith("num:")) { s.multi = false; return setNum(id, s, d.slice(4)); }
       return;
     }
     const m = u.message;
@@ -239,7 +268,7 @@ module.exports = function ({ app, M, P, bz, notifyChapter }) {
       return dids.forEach((d, i) => enqueue(id, s, { mid: m.message_id + i / 100, did: d, name: "Drive fayl", kind: "drive", out: null }));
     }
     const mg = await findManga(text);
-    if (mg) { wipe(s); SS.set(id, Object.assign(fresh(), { mg, step: "num" })); const f = info(mg); return say(id, f.text, [[{ text: "➕ " + f.next, callback_data: "num:" + f.next }]]); }
+    if (mg) { wipe(s); SS.set(id, Object.assign(fresh(), { mg, step: "num" })); const f = info(mg); return say(id, f.text, [[{ text: "📚 Ko'p bob", callback_data: "multi" }, { text: "➕ " + f.next, callback_data: "num:" + f.next }]]); }
     if (/(manga|manhwa|manhua|novella)\/|[?&]s=/i.test(text)) return say(id, "Manga topilmadi. Havolani tekshiring.");
     if (/^\d+([.,]\d+)?$/.test(text)) return setNum(id, s, text);
     return say(id, s.step == "link" ? "Havola kiriting." : s.step == "num" ? "Bob raqamini kiriting." : "PDF yoki rasm yuboring.");

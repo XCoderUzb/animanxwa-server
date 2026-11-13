@@ -3,7 +3,10 @@ const { MONGODB_URI, ADMIN_PASS_1, ADMIN_PASS_2 } = process.env;
 if (!MONGODB_URI || !ADMIN_PASS_1 || !ADMIN_PASS_2) { console.error("MONGODB_URI, ADMIN_PASS_1 va ADMIN_PASS_2 kerak"); process.exit(1); }
 const SECRET = process.env.SESSION_SECRET || crypto.createHash("sha256").update(MONGODB_URI + ADMIN_PASS_2).digest("hex");
 const app = express(); app.disable("x-powered-by"); app.set("trust proxy", 1); app.use(cors()); app.use(express.json({ limit: "2mb" }));
-let M, P, C, N, D, R, A, U, S, SM, SP, SR; // manga, pages, cfg, bildirishnomalar, qurilmalar, baholar
+try { app.use(require("compression")()); } catch (e) { console.log("compression o'rnatilmagan"); }
+let MCACHE = { t: 0, j: "" }; // manga ro'yxati 20 soniya xotirada turadi (ko'p foydalanuvchida server tez ishlashi uchun)
+app.use((q, r, n) => { if (q.method !== "GET" && /^\/api\/admin\//.test(q.path)) MCACHE.t = 0; n(); });
+let M, P, C, N, D, R, A, U, S, SM, SP, SR, L; // manga, pages, cfg, bildirishnomalar, qurilmalar, baholar
 
 const sign = o => { const b = Buffer.from(JSON.stringify(o)).toString("base64url"); return b + "." + crypto.createHmac("sha256", SECRET).update(b).digest("base64url"); };
 const verify = t => { try { const [b, s] = String(t).split("."); const e = crypto.createHmac("sha256", SECRET).update(b).digest("base64url");
@@ -24,9 +27,10 @@ const fails = new Map();
 app.get("/", (q, r) => r.send("AniManxwa API ishlayapti"));
 
 // --- hamma uchun ---
-app.get("/api/manga", wrap(async (q, r) => r.json((await M.find({}).sort({ _id: 1 }).toArray()).map(m => ({ id: m._id, ...m, _id: undefined })))));
+const mlist = async () => { if (Date.now() - MCACHE.t < 20000) return MCACHE.j; const l = (await M.find({}).sort({ _id: 1 }).toArray()).map(m => ({ id: m._id, ...m, _id: undefined })); MCACHE = { t: Date.now(), j: JSON.stringify(l) }; return MCACHE.j; };
+app.get("/api/manga", wrap(async (q, r) => { r.set("Content-Type", "application/json; charset=utf-8").set("Cache-Control", "public, max-age=15").send(await mlist()); }));
 app.get("/api/chapter/:m/:c", wrap(async (q, r) => { const p = await P.findOne({ _id: +q.params.c, mid: +q.params.m }); if (!p) return r.status(404).json({ error: "Topilmadi" }); r.json({ pages: p.pages }); }));
-app.post("/api/read/:id", wrap(async (q, r) => { await M.updateOne({ _id: +q.params.id }, { $inc: { reads: 1 } }); r.json({ ok: 1 }); }));
+app.post("/api/read/:id", wrap(async (q, r) => { await M.updateOne({ _id: +q.params.id }, { $inc: { reads: 1 } }); L.insertOne({ m: +q.params.id, d: new Date() }).catch(() => {}); r.json({ ok: 1 }); }));
 
 // --- admin kirish: parol serverda tekshiriladi ---
 app.post("/api/auth", wrap(async (q, r) => {
@@ -38,7 +42,7 @@ app.post("/api/auth", wrap(async (q, r) => {
 }));
 
 // --- admin: manga va boblar ---
-app.post("/api/admin/manga", adm(1), wrap(async (q, r) => { const id = await nextId(); await M.insertOne({ _id: id, ...clean(q.body || {}), reads: 0, chapters: [] }); r.json({ id }); }));
+app.post("/api/admin/manga", adm(1), wrap(async (q, r) => { const id = await nextId(); await M.insertOne({ _id: id, ...clean(q.body || {}), reads: 0, chapters: [], at: Date.now() }); r.json({ id }); }));
 app.put("/api/admin/manga/:id", adm(1), wrap(async (q, r) => { await M.updateOne({ _id: +q.params.id }, { $set: clean(q.body || {}) }); r.json({ ok: 1 }); }));
 app.delete("/api/admin/manga/:id", adm(1), wrap(async (q, r) => { const id = +q.params.id; await M.deleteOne({ _id: id }); await P.deleteMany({ mid: id }); await N.deleteMany({ mid: id }); r.json({ ok: 1 }); }));
 app.post("/api/admin/manga/:id/chapter", adm(1), wrap(async (q, r) => {
@@ -71,7 +75,7 @@ app.delete("/api/admin/manga/:id/chapter/:cid", adm(1), wrap(async (q, r) => {
   await M.updateOne({ _id: mid }, { $pull: { chapters: { id: cid } } }); await P.deleteOne({ _id: cid });
   if (ch) await N.deleteMany({ mid, num: ch.num, kind: "chap" }); r.json({ ok: 1 });
 }));
-app.post("/api/read/:id/:cid", wrap(async (q, r) => { await M.updateOne({ _id: +q.params.id, "chapters.id": +q.params.cid }, { $inc: { reads: 1, "chapters.$.views": 1 } }); r.json({ ok: 1 }); }));
+app.post("/api/read/:id/:cid", wrap(async (q, r) => { await M.updateOne({ _id: +q.params.id, "chapters.id": +q.params.cid }, { $inc: { reads: 1, "chapters.$.views": 1 } }); L.insertOne({ m: +q.params.id, d: new Date() }).catch(() => {}); r.json({ ok: 1 }); }));
 app.post("/api/like/:id/:cid", wrap(async (q, r) => { const d = (q.body || {}).d == -1 ? -1 : 1; await M.updateOne({ _id: +q.params.id, "chapters.id": +q.params.cid }, { $inc: { "chapters.$.likes": d } }); r.json({ ok: 1 }); }));
 app.post("/api/rate/:id", wrap(async (q, r) => {
   const id = +q.params.id, b = q.body || {}, uid = str(b.uid, 40), v = Math.min(10, Math.max(1, num(b.v)));
@@ -92,7 +96,7 @@ app.delete("/api/admin/baza/:i", adm(2), wrap(async (q, r) => { const l = await 
 
 // --- ilova versiyasi (eski versiyalarni to'xtatish) ---
 app.get("/api/version", wrap(async (q, r) => { const v = (await C.findOne({ _id: "app" })) || {}; r.json({ min: v.min || 0, url: v.url || "", block: v.block !== false }); }));
-app.post("/api/admin/version", adm(2), wrap(async (q, r) => { const b = q.body || {}; await C.updateOne({ _id: "app" }, { $set: { min: num(b.min), url: str(b.url, 500) } }, { upsert: true }); r.json({ ok: 1 }); }));
+app.post("/api/admin/version", adm(2), wrap(async (q, r) => { const b = q.body || {}; const old = (await C.findOne({ _id: "app" })) || {}, set = { min: num(b.min), url: str(b.url, 500) }; if (set.min !== (old.min || 0)) set.relAt = Date.now(); await C.updateOne({ _id: "app" }, { $set: set }, { upsert: true }); r.json({ ok: 1 }); }));
 
 // --- reklama va obuna (premium) ---
 const oid = s => { try { return new ObjectId(String(s)); } catch (e) { return null; } };
@@ -110,6 +114,17 @@ app.post("/api/admin/premium", adm(2), wrap(async (q, r) => {
   const b = q.body || {}, id = str(b.uid, 40).replace(/\s/g, ""), days = Math.max(0, num(b.days)); if (!/^\d{10,40}$/.test(id)) return r.status(400).json({ error: "ID noto'g'ri" });
   const d = await D.findOne({ _id: id }), from = Math.max(Date.now(), (d && d.premium) || 0);
   await D.updateOne({ _id: id }, { $set: { premium: days ? from + days * 864e5 : 0 } }, { upsert: true }); r.json({ ok: 1 });
+}));
+app.get("/api/admin/stats", adm(1), wrap(async (q, r) => {
+  const now = Date.now(), day = 864e5, ap = (await C.findOne({ _id: "app" })) || {}, rel = ap.relAt || 0;
+  const [total, dau, wau, mau, since, mangaN, agg] = await Promise.all([D.countDocuments({}), D.countDocuments({ at: { $gt: now - day } }), D.countDocuments({ at: { $gt: now - 7 * day } }), D.countDocuments({ at: { $gt: now - 30 * day } }), D.countDocuments({ first: { $gt: rel } }), M.countDocuments({}), M.aggregate([{ $group: { _id: null, r: { $sum: "$reads" }, c: { $sum: { $size: { $ifNull: ["$chapters", []] } } } } }]).toArray()]);
+  const builds = await D.aggregate([{ $group: { _id: "$build", n: { $sum: 1 } } }, { $sort: { n: -1 } }, { $limit: 6 }]).toArray();
+  const d0 = new Date(), from = { month: new Date(d0.getFullYear(), d0.getMonth(), 1), year: new Date(d0.getFullYear(), 0, 1) }[q.query.range] || new Date(0);
+  const g = await L.aggregate([{ $match: { d: { $gte: from } } }, { $group: { _id: "$m", n: { $sum: 1 } } }, { $sort: { n: -1 } }]).toArray();
+  const mgs = await M.find({ _id: { $in: g.map(x => x._id) } }).project({ title: 1, genres: 1 }).toArray(), by = Object.fromEntries(mgs.map(m => [m._id, m])), genres = {};
+  g.forEach(x => ((by[x._id] || {}).genres || []).forEach(t => { genres[t] = (genres[t] || 0) + x.n; }));
+  r.json({ users: { total, dau, wau, mau, since, relAt: rel }, builds: builds.map(b => ({ b: b._id || 0, n: b.n })), totals: { manga: mangaN, reads: (agg[0] || {}).r || 0, chapters: (agg[0] || {}).c || 0 },
+    top: g.slice(0, 10).map(x => ({ id: x._id, title: (by[x._id] || {}).title || "?", n: x.n })), genres: Object.entries(genres).sort((a, b) => b[1] - a[1]).slice(0, 10).map(x => ({ g: x[0], n: x[1] })) });
 }));
 app.post("/api/admin/shield", adm(2), wrap(async (q, r) => { await C.updateOne({ _id: "app" }, { $set: { block: !!(q.body || {}).on } }, { upsert: true }); r.json({ ok: 1 }); }));
 
@@ -161,7 +176,7 @@ const notifyChapter = (mg, ch) => {
 };
 app.post("/api/dev", wrap(async (q, r) => {
   const b = q.body || {}, id = str(b.uid, 40); if (!/^\d{10,40}$/.test(id)) return r.status(400).json({ error: "uid" });
-  await D.updateOne({ _id: id }, { $set: { saved: (Array.isArray(b.saved) ? b.saved : []).slice(0, 500).map(Number).filter(Number.isFinite), at: Date.now(), ...(typeof b.token == "string" && b.token.length > 20 ? { token: str(b.token, 400) } : {}) } }, { upsert: true }); r.json({ ok: 1 });
+  await D.updateOne({ _id: id }, { $set: { saved: (Array.isArray(b.saved) ? b.saved : []).slice(0, 500).map(Number).filter(Number.isFinite), at: Date.now(), build: num(b.build), ...(typeof b.token == "string" && b.token.length > 20 ? { token: str(b.token, 400) } : {}) }, $setOnInsert: { first: Date.now() } }, { upsert: true }); r.json({ ok: 1 });
 }));
 app.get("/api/notif", wrap(async (q, r) => {
   const dv = await D.findOne({ _id: str(q.query.uid, 40) }), sv = dv ? dv.saved : [];
@@ -183,7 +198,7 @@ const findSite = (q, r, n, mine) => S.findOne({ _id: String(q.params.slug).toLow
 }).catch(() => r.status(500).json({ error: "Server xatosi" }));
 const pub = (q, r, n) => findSite(q, r, n, false), own = (q, r, n) => findSite(q, r, n, true);
 const sdoc = m => ({ ...m, id: String(m._id), _id: undefined, site: undefined });
-const DEFCFG = { accent: "#7c5cff", sections: [{ k: "search", on: true }, { k: "carousel", on: true }, { k: "top", on: true }, { k: "fresh", on: true }, { k: "all", on: true }], sub: "https://telegram.me/Shadow_Sxi", support: "https://telegram.me/Shadow_Sxi", order: "https://telegram.me/Shadow_Sxi" };
+const DEFCFG = { accent: "#7c5cff", sections: [{ k: "search", on: true }, { k: "carousel", on: true }, { k: "top", on: true }, { k: "fresh", on: true }, { k: "all", on: true }], items: [{ t: "Obuna olish", u: "https://telegram.me/Shadow_Sxi" }, { t: "Qo'llab-quvvatlash", u: "https://telegram.me/Shadow_Sxi" }] };
 const mySites = async uid => (await S.find({ owner: uid }).project({ title: 1, slug: 1 }).toArray()).map(x => ({ slug: x.slug, title: x.title }));
 
 app.post("/api/s/auth", wrap(async (q, r) => {
@@ -223,7 +238,7 @@ app.put("/api/s/:slug/cfg", sauth, own, wrap(async (q, r) => {
   const b = q.body || {}, c = b.cfg || {}, keys = ["search", "carousel", "top", "fresh", "all"];
   const sections = (Array.isArray(c.sections) ? c.sections : []).filter(x => keys.includes(x.k)).map(x => ({ k: x.k, on: !!x.on }));
   keys.forEach(k => { if (!sections.find(x => x.k == k)) sections.push({ k, on: true }); });
-  await S.updateOne({ _id: q.site._id }, { $set: { title: str(b.title || q.site.title, 40), cfg: { accent: /^#[0-9a-f]{6}$/i.test(c.accent) ? c.accent : "#7c5cff", sections, sub: str(c.sub, 300), support: str(c.support, 300), order: str(c.order, 300) } } }); r.json({ ok: 1 });
+  await S.updateOne({ _id: q.site._id }, { $set: { title: str(b.title || q.site.title, 40), cfg: { accent: /^#[0-9a-f]{6}$/i.test(c.accent) ? c.accent : "#7c5cff", sections, items: (Array.isArray(c.items) ? c.items : []).slice(0, 6).map(x => ({ t: str(x.t, 40), u: str(x.u, 300) })).filter(x => x.t) } } }); r.json({ ok: 1 });
 }));
 app.get("/api/s/:slug/bases", sauth, own, (q, r) => r.json({ list: q.site.bases || [] }));
 app.post("/api/s/:slug/bases", sauth, own, wrap(async (q, r) => {
@@ -251,7 +266,7 @@ app.delete("/api/s/:slug/manga/:id/chapter/:cid", sauth, own, wrap(async (q, r) 
 
 app.use((e, q, r, n) => r.status(400).json({ error: "Noto'g'ri so'rov" }));
 MongoClient.connect(MONGODB_URI).then(async c => {
-  const d = c.db("animanxwa"); M = d.collection("manga"); P = d.collection("pages"); C = d.collection("cfg"); N = d.collection("notif"); D = d.collection("dev"); R = d.collection("rates"); A = d.collection("ads"); U = d.collection("users"); S = d.collection("sites"); SM = d.collection("smanga"); SP = d.collection("spages"); SR = d.collection("srates");
+  const d = c.db("animanxwa"); M = d.collection("manga"); P = d.collection("pages"); C = d.collection("cfg"); N = d.collection("notif"); D = d.collection("dev"); R = d.collection("rates"); A = d.collection("ads"); U = d.collection("users"); S = d.collection("sites"); SM = d.collection("smanga"); SP = d.collection("spages"); SR = d.collection("srates"); L = d.collection("rlog"); L.createIndex({ d: 1 }, { expireAfterSeconds: 34000000 }).catch(() => {});
   try { await C.updateOne({ _id: "sinov" }, { $set: { t: Date.now() } }, { upsert: true }); await C.deleteOne({ _id: "sinov" }); console.log("MongoDB yozish sinovi: OK"); }
   catch (e) { console.error("MongoDB yozish sinovi XATO. Atlas > Database Access > foydalanuvchiga 'Read and write to any database' huquqini bering:", e.message); }
   try { require("./bot")({ app, M, P, bz, notifyChapter }); } catch (e) { console.error("Bot yuklanmadi (API ishlayveradi):", e.message); }
