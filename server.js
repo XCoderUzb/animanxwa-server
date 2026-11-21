@@ -4,9 +4,9 @@ if (!MONGODB_URI || !ADMIN_PASS_1 || !ADMIN_PASS_2) { console.error("MONGODB_URI
 const SECRET = process.env.SESSION_SECRET || crypto.createHash("sha256").update(MONGODB_URI + ADMIN_PASS_2).digest("hex");
 const app = express(); app.disable("x-powered-by"); app.set("trust proxy", 1); app.use(cors()); app.use(express.json({ limit: "2mb" }));
 try { app.use(require("compression")()); } catch (e) { console.log("compression o'rnatilmagan"); }
-let MCACHE = { t: 0, j: "" }; // manga ro'yxati 20 soniya xotirada turadi (ko'p foydalanuvchida server tez ishlashi uchun)
+let MCACHE = { t: 0, j: "", s: "" }; // manga ro'yxati 20 soniya xotirada turadi (ko'p foydalanuvchida server tez ishlashi uchun)
 app.use((q, r, n) => { if (q.method !== "GET" && /^\/api\/admin\//.test(q.path)) MCACHE.t = 0; n(); });
-let M, P, C, N, D, R, A, U, S, SM, SP, SR, L; // manga, pages, cfg, bildirishnomalar, qurilmalar, baholar
+let M, P, C, N, D, R, A, U, S, SM, SP, SR, L, G, GC; // manga, pages, cfg, bildirishnomalar, qurilmalar, baholar
 
 const sign = o => { const b = Buffer.from(JSON.stringify(o)).toString("base64url"); return b + "." + crypto.createHmac("sha256", SECRET).update(b).digest("base64url"); };
 const verify = t => { try { const [b, s] = String(t).split("."); const e = crypto.createHmac("sha256", SECRET).update(b).digest("base64url");
@@ -19,18 +19,68 @@ const str = (v, n) => String(v == null ? "" : v).slice(0, n), num = v => Number.
 const list = (a, n) => (Array.isArray(a) ? a : []).slice(0, 30).map(x => str(x, n));
 const clean = b => ({ title: str(b.title, 120), desc: str(b.desc, 4000), author: str(b.author, 120), studio: str(b.studio, 120), year: num(b.year),
   type: ["Manga", "Manhwa", "Manhua", "Novella"].includes(b.type) ? b.type : "Manga", status: b.status == "Tugallangan" ? "Tugallangan" : "Ongoing",
-  pay: b.pay == "Obuna" ? "Obuna" : "Bepul", vols: num(b.vols), seasons: num(b.seasons), genres: list(b.genres, 40), tags: list(b.tags, 40), cover: str(b.cover, 300000) });
+  pay: b.pay == "Obuna" ? "Obuna" : "Bepul", vols: num(b.vols), seasons: num(b.seasons), genres: list(b.genres, 40), tags: list(b.tags, 40), cover: str(b.cover, 300000),
+  ...(b.age === undefined ? {} : { age: [0, 6, 12, 13, 16, 18].includes(+b.age) ? +b.age : 0 }) }); // yosh chegarasi (eski ilovalar yubormasa, o'zgarmaydi)
 const nextId = async () => (await C.findOneAndUpdate({ _id: "mid" }, { $inc: { n: 1 } }, { upsert: true, returnDocument: "after" })).n;
 const bz = async () => ((await C.findOne({ _id: "baza" })) || { list: [] }).list;
 const fails = new Map();
 
+// --- yosh chegarasi: foydalanuvchi yoshi Google akkauntdan olinadi ---
+const pad = n => String(n).padStart(2, "0");
+const ageOf = bd => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(bd || ""); if (!m) return null; const n = new Date(); let a = n.getUTCFullYear() - +m[1]; if (n.getUTCMonth() + 1 < +m[2] || (n.getUTCMonth() + 1 == +m[2] && n.getUTCDate() < +m[3])) a--; return a >= 0 && a < 130 ? a : null; };
+const gsess = q => verify(String(q.headers["x-auth"] || "")); // Google sessiya tokeni (admin tokenidan alohida)
+// admin -> 99, Google bilan kirgan -> yoshi, kirmagan yoki yoshi noma'lum -> null (18+ ko'rsatilmaydi)
+const viewer = q => { const a = verify((q.headers.authorization || "").replace(/^Bearer /, "")); if (a && a.lvl >= 1) return 99; const t = gsess(q); return t && t.g ? ageOf(t.bd) : null; };
+
 app.get("/", (q, r) => r.send("AniManxwa API ishlayapti"));
 
 // --- hamma uchun ---
-const mlist = async () => { if (Date.now() - MCACHE.t < 20000) return MCACHE.j; const l = (await M.find({}).sort({ _id: 1 }).toArray()).map(m => ({ id: m._id, ...m, _id: undefined })); MCACHE = { t: Date.now(), j: JSON.stringify(l) }; return MCACHE.j; };
-app.get("/api/manga", wrap(async (q, r) => { r.set("Content-Type", "application/json; charset=utf-8").set("Cache-Control", "public, max-age=15").send(await mlist()); }));
-app.get("/api/chapter/:m/:c", wrap(async (q, r) => { const p = await P.findOne({ _id: +q.params.c, mid: +q.params.m }); if (!p) return r.status(404).json({ error: "Topilmadi" }); r.json({ pages: p.pages }); }));
+const mlist = async safe => { if (Date.now() - MCACHE.t >= 20000) { const l = (await M.find({}).sort({ _id: 1 }).toArray()).map(m => ({ id: m._id, ...m, _id: undefined })); MCACHE = { t: Date.now(), j: JSON.stringify(l), s: JSON.stringify(l.filter(m => !(m.age >= 18))) }; } return safe ? MCACHE.s : MCACHE.j; };
+app.get("/api/manga", wrap(async (q, r) => { r.set("Content-Type", "application/json; charset=utf-8").set("Cache-Control", "private, max-age=15").set("Vary", "Authorization, X-Auth").send(await mlist(!(viewer(q) >= 18))); }));
+app.get("/api/chapter/:m/:c", wrap(async (q, r) => { const mg = await M.findOne({ _id: +q.params.m }, { projection: { age: 1 } }); if (mg && mg.age >= 18 && !(viewer(q) >= 18)) return r.status(403).json({ error: "Bu manga 18+. Ko'rish uchun 18 yoshdan katta bo'lib, Google orqali kiring" }); const p = await P.findOne({ _id: +q.params.c, mid: +q.params.m }); if (!p) return r.status(404).json({ error: "Topilmadi" }); r.json({ pages: p.pages }); }));
 app.post("/api/read/:id", wrap(async (q, r) => { await M.updateOne({ _id: +q.params.id }, { $inc: { reads: 1 } }); L.insertOne({ m: +q.params.id, d: new Date() }).catch(() => {}); r.json({ ok: 1 }); }));
+
+// --- Google orqali kirish (ilova -> sayt login.html -> animanxwa://login?code=...) ---
+app.post("/api/auth/google", wrap(async (q, r) => { // login.html chaqiradi: Google access token + ilova yaratgan nonce
+  const b = q.body || {}, at = str(b.token, 4000), n = str(b.n, 80);
+  if (!at || !/^[\w-]{16,80}$/.test(n)) return r.status(400).json({ error: "So'rov noto'g'ri" });
+  const g = await (await fetch("https://oauth2.googleapis.com/tokeninfo?access_token=" + encodeURIComponent(at))).json();
+  if ((g.aud !== GCID && g.azp !== GCID) || !g.sub) return r.status(401).json({ error: "Google tekshiruvi o'tmadi" });
+  const pr = await fetch("https://people.googleapis.com/v1/people/me?personFields=names,photos,emailAddresses,birthdays", { headers: { Authorization: "Bearer " + at } });
+  const p = pr.ok ? await pr.json() : {};
+  let bd = null; for (const x of p.birthdays || []) { const d = x.date; if (d && d.year && d.month && d.day) { bd = d.year + "-" + pad(d.month) + "-" + pad(d.day); if (x.metadata && x.metadata.source && x.metadata.source.type == "ACCOUNT") break; } }
+  const name = str(((p.names || [])[0] || {}).displayName || g.email || "Foydalanuvchi", 80), pic = str(((p.photos || [])[0] || {}).url || "", 400);
+  await G.updateOne({ _id: g.sub }, { $set: { email: str(g.email, 120), name, picture: pic, at: Date.now(), ...(bd ? { bd, bds: "google" } : {}) }, $setOnInsert: { first: Date.now() } }, { upsert: true });
+  const code = crypto.randomBytes(4).toString("hex").toUpperCase();
+  await GC.insertOne({ _id: code, sub: g.sub, n, exp: Date.now() + 18e4, at: new Date() });
+  r.json({ code, hasBd: !!bd });
+}));
+const gout = (a, uid) => ({ token: sign({ g: a._id, bd: a.bd || null, exp: Date.now() + 90 * 864e5 }), uid, user: { name: a.name, email: a.email, picture: a.picture, bd: a.bd || null, bds: a.bds || "" } });
+app.post("/api/auth/exchange", wrap(async (q, r) => { // ilova kodni almashtiradi
+  const b = q.body || {}, code = str(b.code, 20).toUpperCase().replace(/[^A-Z0-9]/g, ""), n = str(b.n, 80), uid = str(b.uid, 40);
+  if (!/^\d{10,40}$/.test(uid)) return r.status(400).json({ error: "uid" });
+  const c = await GC.findOneAndDelete({ _id: code, n });
+  if (!c || c.exp < Date.now()) return r.status(400).json({ error: "Kod noto'g'ri yoki muddati tugagan. Qaytadan urinib ko'ring" });
+  const a = await G.findOne({ _id: c.sub }); if (!a) return r.status(400).json({ error: "Akkaunt topilmadi" });
+  let use = uid;
+  if (a.uid && a.uid !== uid) { // akkaunt boshqa qurilmada ochilgan: o'sha ID ga o'tamiz, obuna (premium) yo'qolmasin
+    use = a.uid; const [x, y] = await Promise.all([D.findOne({ _id: uid }), D.findOne({ _id: a.uid })]), pm = Math.max((x && x.premium) || 0, (y && y.premium) || 0);
+    if (pm) await D.updateOne({ _id: a.uid }, { $set: { premium: pm } }, { upsert: true });
+  } else if (!a.uid) await G.updateOne({ _id: a._id }, { $set: { uid } });
+  r.json(gout(a, use));
+}));
+app.get("/api/auth/me", wrap(async (q, r) => { // tokenni yangilaydi va yoshni qaytaradi
+  const t = gsess(q); if (!t || !t.g) return r.status(401).json({ error: "Sessiya tugadi" });
+  const a = await G.findOne({ _id: t.g }); if (!a) return r.status(401).json({ error: "Akkaunt topilmadi" });
+  r.json(gout(a, a.uid || ""));
+}));
+app.post("/api/auth/bd", wrap(async (q, r) => { // Google tug'ilgan sanani bermagan bo'lsa, bir marta qo'lda kiritiladi
+  const t = gsess(q); if (!t || !t.g) return r.status(401).json({ error: "Avval Google orqali kiring" });
+  const a = await G.findOne({ _id: t.g }); if (!a) return r.status(401).json({ error: "Akkaunt topilmadi" });
+  if (a.bd) return r.status(400).json({ error: "Tug'ilgan sana allaqachon kiritilgan" });
+  const bd = str((q.body || {}).bd, 10), ag = ageOf(bd); if (ag == null || ag < 3 || ag > 110) return r.status(400).json({ error: "Sana noto'g'ri" });
+  a.bd = bd; a.bds = "manual"; await G.updateOne({ _id: a._id }, { $set: { bd, bds: "manual" } }); r.json(gout(a, a.uid || ""));
+}));
 
 // --- admin kirish: parol serverda tekshiriladi ---
 app.post("/api/auth", wrap(async (q, r) => {
@@ -266,7 +316,7 @@ app.delete("/api/s/:slug/manga/:id/chapter/:cid", sauth, own, wrap(async (q, r) 
 
 app.use((e, q, r, n) => r.status(400).json({ error: "Noto'g'ri so'rov" }));
 MongoClient.connect(MONGODB_URI).then(async c => {
-  const d = c.db("animanxwa"); M = d.collection("manga"); P = d.collection("pages"); C = d.collection("cfg"); N = d.collection("notif"); D = d.collection("dev"); R = d.collection("rates"); A = d.collection("ads"); U = d.collection("users"); S = d.collection("sites"); SM = d.collection("smanga"); SP = d.collection("spages"); SR = d.collection("srates"); L = d.collection("rlog"); L.createIndex({ d: 1 }, { expireAfterSeconds: 34000000 }).catch(() => {});
+  const d = c.db("animanxwa"); M = d.collection("manga"); P = d.collection("pages"); C = d.collection("cfg"); N = d.collection("notif"); D = d.collection("dev"); R = d.collection("rates"); A = d.collection("ads"); U = d.collection("users"); S = d.collection("sites"); SM = d.collection("smanga"); SP = d.collection("spages"); SR = d.collection("srates"); L = d.collection("rlog"); G = d.collection("acc"); GC = d.collection("acode"); GC.createIndex({ at: 1 }, { expireAfterSeconds: 900 }).catch(() => {}); L.createIndex({ d: 1 }, { expireAfterSeconds: 34000000 }).catch(() => {});
   try { await C.updateOne({ _id: "sinov" }, { $set: { t: Date.now() } }, { upsert: true }); await C.deleteOne({ _id: "sinov" }); console.log("MongoDB yozish sinovi: OK"); }
   catch (e) { console.error("MongoDB yozish sinovi XATO. Atlas > Database Access > foydalanuvchiga 'Read and write to any database' huquqini bering:", e.message); }
   try { require("./bot")({ app, M, P, bz, notifyChapter }); } catch (e) { console.error("Bot yuklanmadi (API ishlayveradi):", e.message); }

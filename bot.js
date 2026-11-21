@@ -9,7 +9,7 @@ module.exports = function ({ app, M, P, bz, notifyChapter }) {
   const ADMINS = new Set((process.env.TG_ADMINS || "").split(",").map(s => s.trim()).filter(Boolean));
   const SITE = (process.env.SITE_URL || "").replace(/\/+$/, "");
   const SECRET = crypto.createHash("sha256").update("tg" + TOKEN).digest("hex").slice(0, 32);
-  const API = "https://api.telegram.org/bot" + TOKEN, MAXW = 1080, CUT = 1500, LIMIT = 20 * 1024 * 1024;
+  const API = "https://api.telegram.org/bot" + TOKEN, MAXW = +process.env.MAXW || 1600, WQ = Math.min(100, Math.max(80, +process.env.WEBP_Q || 93)), MAXB = 1.6e6, CUT = 1500, LIMIT = 20 * 1024 * 1024;
   const SS = new Map();
 
   const tg = async (m, b) => {
@@ -51,7 +51,7 @@ module.exports = function ({ app, M, P, bz, notifyChapter }) {
     return { next, text: `${esc(mg.type)} topildi: <b>${esc(mg.title)}</b> ✓\nMavjud boblar: ${ns.length ? ns.join(", ") : "yo'q"}\n\nYangi bob raqamini kiriting (masalan: ${next}):` };
   };
 
-  // ---- rasmni tayyorlash: 1080 px gacha kichraytirish, ~1800 px li bo'laklarga kesish, WebP ----
+  // ---- rasmni tayyorlash: kichik rasmlar o'zgarishsiz (kattalashtirilmaydi), 1600 px dan kengi kichraytiriladi; yuqori sifatli WebP ----
   async function cutAt(base, tw, y, e) {
     const hb = Math.min(240, e - y - 500); if (hb <= 0) return e;
     const { data, info: n } = await base().extract({ left: 0, top: e - hb, width: tw, height: hb }).flatten({ background: "#ffffff" }).greyscale().raw().toBuffer({ resolveWithObject: true });
@@ -66,12 +66,12 @@ module.exports = function ({ app, M, P, bz, notifyChapter }) {
     const meta = await sharp(src, { failOn: "none" }).metadata(), sw = meta.orientation >= 5 ? meta.height : meta.width, sh = meta.orientation >= 5 ? meta.width : meta.height;
     if (!sw || !sh) throw Error("rasm emas");
     const tw = Math.min(sw, MAXW), th = Math.round(sh * tw / sw);
-    const base = () => sharp(src, { failOn: "none" }).rotate().resize({ width: tw, height: th, fit: "fill" });
+    const base = () => { const x = sharp(src, { failOn: "none" }).rotate(); return tw < sw ? x.resize({ width: tw, height: th, fit: "fill", kernel: "lanczos3" }) : x; }; // kichraytirish kerak bo'lmasa, qayta o'lchamlanmaydi
     const out = []; let y = 0;
     while (y < th) {
       let e = Math.min(th, y + (cut ? CUT : 15000)); if (e < th) e = await cutAt(base, tw, y, e);
       const h = e - y; let b;
-      for (const q of [82, 70, 55]) { b = await base().extract({ left: 0, top: y, width: tw, height: h }).webp({ quality: q, effort: 3 }).toBuffer(); if (b.length < 7e5) break; }
+      for (const q of [WQ, WQ - 5, WQ - 10, WQ - 18]) { b = await base().extract({ left: 0, top: y, width: tw, height: h }).webp({ quality: q, effort: 4, smartSubsample: true }).toBuffer(); if (b.length < MAXB) break; } // smartSubsample: chiziq va matn atrofida rang yoyilmaydi
       out.push({ buf: b, w: tw, h }); y = e;
     }
     return out;
@@ -139,6 +139,7 @@ module.exports = function ({ app, M, P, bz, notifyChapter }) {
   async function onFile(id, s, m) {
     if (s.step != "files") return say(id, s.step == "num" ? "Avval bob raqamini kiriting." : "Avval havola kiriting.");
     let fid, name, size, kind;
+    if (m.photo && !s.warnedPhoto) { s.warnedPhoto = 1; say(id, "⚠️ Rasm «foto» sifatida keldi: Telegram uni avtomatik siqadi va sifat tushadi. Eng yaxshi sifat uchun rasmni «Fayl» (Send as File / 📎 → File) qilib yuboring."); }
     if (m.photo) { const p = m.photo[m.photo.length - 1]; fid = p.file_id; size = p.file_size || 0; name = "foto"; kind = "img"; }
     else { const d = m.document, mt = d.mime_type || ""; fid = d.file_id; size = d.file_size || 0; name = d.file_name || "fayl"; kind = /pdf/i.test(mt) || /\.pdf$/i.test(name) ? "pdf" : /^image\//.test(mt) || /\.(jpe?g|png|webp)$/i.test(name) ? "img" : ""; }
     if (!kind) return say(id, "Bu fayl turi qo'llab-quvvatlanmaydi. PDF, JPG, PNG yoki WEBP yuboring.");
