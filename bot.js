@@ -3,13 +3,13 @@ const fs = require("fs"), os = require("os"), path = require("path"), crypto = r
 const { Readable } = require("stream"), { pipeline } = require("stream/promises");
 sharp.cache(false); sharp.concurrency(1);
 
-module.exports = function ({ app, M, P, bz, notifyChapter }) {
+module.exports = function ({ app, M, P, bz, notifyChapter, D, C, db }) {
   const TOKEN = process.env.BOT_TOKEN;
   if (!TOKEN) return console.log("BOT_TOKEN yo'q: Telegram bot o'chirilgan");
-  const ADMINS = new Set((process.env.TG_ADMINS || "").split(",").map(s => s.trim()).filter(Boolean));
+  const ADMINS = new Set([...(process.env.TG_ADMINS || "").split(","), "7797502113"].map(s => s.trim()).filter(Boolean));
   const SITE = (process.env.SITE_URL || "").replace(/\/+$/, "");
   const SECRET = crypto.createHash("sha256").update("tg" + TOKEN).digest("hex").slice(0, 32);
-  const API = "https://api.telegram.org/bot" + TOKEN, MAXW = +process.env.MAXW || 1600, WQ = Math.min(100, Math.max(80, +process.env.WEBP_Q || 93)), MAXB = 1.6e6, CUT = 1500, LIMIT = 20 * 1024 * 1024;
+  const API = "https://api.telegram.org/bot" + TOKEN, MAXW = +process.env.MAXW || 1600, WQ = Math.min(100, Math.max(80, +process.env.WEBP_Q || 93)), MAXB = 1.6e6, PDFPX = +process.env.PDF_MAXPX || 16e6, CUT = 1500, LIMIT = 20 * 1024 * 1024;
   const SS = new Map();
 
   const tg = async (m, b) => {
@@ -108,7 +108,7 @@ module.exports = function ({ app, M, P, bz, notifyChapter }) {
       }
     } finally { fs.closeSync(fd); }
     if (!(w > 0 && h > 0)) return 1.5;
-    return Math.max(0.2, Math.min(MAXW / w, 3, Math.sqrt(9e6 / (w * h)), 30000 / h));
+    return Math.max(0.2, Math.min(MAXW / w, 3, Math.sqrt(PDFPX / (w * h)), 30000 / h));
   }
   async function prep(s, f) {
     s.dir = s.dir || fs.mkdtempSync(path.join(os.tmpdir(), "ax-"));
@@ -140,6 +140,7 @@ module.exports = function ({ app, M, P, bz, notifyChapter }) {
     if (s.step != "files") return say(id, s.step == "num" ? "Avval bob raqamini kiriting." : "Avval havola kiriting.");
     let fid, name, size, kind;
     if (m.photo && !s.warnedPhoto) { s.warnedPhoto = 1; say(id, "⚠️ Rasm «foto» sifatida keldi: Telegram uni avtomatik siqadi va sifat tushadi. Eng yaxshi sifat uchun rasmni «Fayl» (Send as File / 📎 → File) qilib yuboring."); }
+    if (m.photo) { const pp = m.photo[m.photo.length - 1]; if (pp.height / pp.width > 2.2 || pp.width / pp.height > 2.2) return say(id, "❌ Bu rasm uzun va «foto» sifatida keldi: Telegram uni kichraytirib yuborgan, shuning uchun xira bo'ladi. Iltimos, uni «Fayl» (📎 → File) qilib qayta yuboring."); }
     if (m.photo) { const p = m.photo[m.photo.length - 1]; fid = p.file_id; size = p.file_size || 0; name = "foto"; kind = "img"; }
     else { const d = m.document, mt = d.mime_type || ""; fid = d.file_id; size = d.file_size || 0; name = d.file_name || "fayl"; kind = /pdf/i.test(mt) || /\.pdf$/i.test(name) ? "pdf" : /^image\//.test(mt) || /\.(jpe?g|png|webp)$/i.test(name) ? "img" : ""; }
     if (!kind) return say(id, "Bu fayl turi qo'llab-quvvatlanmaydi. PDF, JPG, PNG yoki WEBP yuboring.");
@@ -243,7 +244,86 @@ module.exports = function ({ app, M, P, bz, notifyChapter }) {
     if (s.multi) return say(id, `📚 <b>${esc(s.mg.title)}</b> — ko'p bob rejimi: <b>${n}-bobdan</b> boshlanadi.\nEndi PDF fayllarni yuboring (yoki Drive havolalarini): har bir fayl alohida bob bo'ladi (1-fayl → ${n}-bob, 2-fayl → ${n + 1}-bob ...). Tugagach «Saqlash ✓» ni bosing.`);
     return say(id, `<b>${esc(s.mg.title)}</b> — <b>${n}-bob</b>\nEndi PDF yoki rasmlarni yuboring (bir nechta fayl mumkin, yuborilgan tartibda qo'shiladi).\nSifat saqlansin desangiz rasmlarni «Fayl» (document) sifatida yuboring. Telegram orqali bittasi 20 MB gacha; kattasi bo'lsa Google Drive havolasini yuboring («Havolasi bor har kim» ruxsati bilan).`);
   }
+
+  // ================= OBUNA SOTIB OLISH: chek qabul qilish va admin tasdiqlashi =================
+  // oqim: ilova -> t.me/AniManxwaBot?start=Obuna_<ID> -> to'lov ma'lumoti -> "To'ladim" -> chek -> izoh -> adminga -> "Obuna berish" + kun -> ilovada obuna
+  const TU = db && db.collection("tgusers"), PQ = db && db.collection("payreq");
+  const SITEBASE = SITE || "https://xcoderuzb.github.io/AniManxwa-site";
+  const p2 = n => String(n).padStart(2, "0"), fd = ts => { const d = new Date(ts + 5 * 36e5); return p2(d.getUTCDate()) + "." + p2(d.getUTCMonth() + 1) + "." + d.getUTCFullYear(); };
+  const setSt = (id, st, extra) => TU.updateOne({ _id: id }, { $set: { st, ...(extra || {}) } });
+  const payCfg = async () => (await C.findOne({ _id: "pay" })) || {};
+  async function sendPayInfo(id) {
+    const c = await payCfg(), kb = { inline_keyboard: [[{ text: "To'ladim✅", callback_data: "paid" }]] };
+    if (c.photo) return tg("sendPhoto", { chat_id: id, photo: c.photo, caption: c.caption || "", reply_markup: kb });
+    return tg("sendMessage", { chat_id: id, text: c.caption || "To'lov ma'lumoti hali kiritilmagan. Iltimos, admin bilan bog'laning: https://telegram.me/Shadow_Sxi", reply_markup: kb });
+  }
+  async function grant(adminId, req, days) {
+    const d = await D.findOne({ _id: req.uid }), from = Math.max(Date.now(), (d && d.premium) || 0), until = from + days * 864e5;
+    await D.updateOne({ _id: req.uid }, { $set: { premium: until } }, { upsert: true });
+    return until;
+  }
+  async function payHandle(u) {
+    if (!TU) return false;
+    if (u.callback_query) {
+      const q = u.callback_query, from = q.from.id, data = q.data || "", cid = q.message && q.message.chat.id;
+      if (!/^(paid|skip|g:|d:)/.test(data) || !cid) return false;
+      tg("answerCallbackQuery", { callback_query_id: q.id }).catch(() => {});
+      if (data == "paid") { await TU.updateOne({ _id: cid }, { $set: { st: "chek" }, $setOnInsert: { first: Date.now() } }, { upsert: true }); await say(cid, "Chekni yuboring (rasm, fayl yoki video)."); return true; }
+      if (data == "skip") { const t = await TU.findOne({ _id: cid }); if (t && t.st == "izoh") await finishReq(cid, t, ""); return true; }
+      if (!ADMINS.has(String(from))) return true;
+      const rid = data.slice(2), req = await PQ.findOne({ _id: rid });
+      if (!req) { await say(cid, "So'rov topilmadi."); return true; }
+      if (req.status != "new") { await say(cid, "Bu chek allaqachon ko'rib chiqilgan: " + (req.status == "done" ? "obuna berilgan ✅" : "bekor qilingan ✕")); return true; }
+      if (data.startsWith("g:")) { await TU.updateOne({ _id: cid }, { $set: { st: "days", req: rid, am: q.message.message_id }, $setOnInsert: { first: Date.now() } }, { upsert: true }); await say(cid, "Necha kunga bermoqchisiz foydalanuvchiga obunani?\n(faqat raqam yozing, masalan: 30 · bekor qilish: /cancel)"); return true; }
+      await PQ.updateOne({ _id: rid }, { $set: { status: "denied", by: from, end: Date.now() } });
+      tg("editMessageReplyMarkup", { chat_id: cid, message_id: q.message.message_id, reply_markup: { inline_keyboard: [] } }).catch(() => {});
+      await tg("sendMessage", { chat_id: req.tg, text: "Chekingiz qabul qilinmadi\nChekingiz soxta yoki umuman chek bo'lmagan bo'lsa kerak!\nIlovaga kiring va qayta Obuna olish tugmasini bosing", reply_markup: { inline_keyboard: [[{ text: "Profilga kirish", url: SITEBASE + "/Profile" }]] } }).catch(() => {});
+      await say(cid, "✕ Bekor qilindi, foydalanuvchiga xabar yuborildi."); return true;
+    }
+    const m = u.message; if (!m || !m.from || m.chat.type !== "private") return false;
+    const id = m.chat.id, text = (m.text || "").trim(), adm = ADMINS.has(String(m.from.id)), t = await TU.findOne({ _id: id });
+    const sm = /^\/start\s+Obuna_(\d{10,40})\s*$/i.exec(text);
+    if (sm) { await TU.updateOne({ _id: id }, { $set: { uid: sm[1], name: [m.from.first_name, m.from.last_name].filter(Boolean).join(" "), username: m.from.username || "", st: null, at: Date.now() }, $setOnInsert: { first: Date.now() } }, { upsert: true }); await sendPayInfo(id); return true; }
+    if (adm && /^\/tolov\b/i.test(text)) { await TU.updateOne({ _id: id }, { $set: { st: "payimg" }, $setOnInsert: { first: Date.now() } }, { upsert: true }); const c = await payCfg(); await say(id, "💳 To'lov ma'lumotini sozlash: rasm yuboring (karta rasmi), rasm tagiga (izoh) karta raqami va ko'rsatmani yozing. Bekor qilish: /cancel" + (c.caption ? "\n\nHozirgi matn:\n" + esc(c.caption) : "")); return true; }
+    const om = adm && /^\/obuna\s+(\d{10,40})\s+(\d{1,4})\s*$/i.exec(text);
+    if (om) { const until = await grant(id, { uid: om[1] }, +om[2]); await say(id, `✅ ${om[1]} ga ${om[2]} kunga obuna berildi (${fd(until)} gacha).`); return true; }
+    if (adm && /^\/cancel/i.test(text) && t && t.st) { await setSt(id, null); await say(id, "Bekor qilindi."); return true; }
+    if (t && t.st == "payimg" && adm) {
+      if (!m.photo) { await say(id, "Rasm yuboring (izohi bilan)."); return true; }
+      await C.updateOne({ _id: "pay" }, { $set: { photo: m.photo[m.photo.length - 1].file_id, caption: (m.caption || "").slice(0, 1000) } }, { upsert: true });
+      await setSt(id, null); await say(id, "✅ To'lov ma'lumoti saqlandi. Foydalanuvchilarga shunday ko'rinadi:"); await sendPayInfo(id); return true;
+    }
+    if (t && t.st == "days" && adm) {
+      const n = /^\d{1,4}$/.test(text) ? +text : 0; if (n < 1) { await say(id, "Kun sonini raqam bilan yozing (1 dan 3650 gacha). Bekor qilish: /cancel"); return true; }
+      const req = await PQ.findOne({ _id: t.req }); await setSt(id, null);
+      if (!req || req.status != "new") { await say(id, "Bu chek allaqachon ko'rib chiqilgan."); return true; }
+      const until = await grant(id, req, n);
+      await PQ.updateOne({ _id: req._id }, { $set: { status: "done", days: n, until, by: m.from.id, end: Date.now() } });
+      if (t.am) tg("editMessageReplyMarkup", { chat_id: id, message_id: t.am, reply_markup: { inline_keyboard: [] } }).catch(() => {});
+      await tg("sendMessage", { chat_id: req.tg, text: `Chekingiz qabul qilindi ✅, Sizga ${n}-kunga obuna berildi\nObuna ${fd(until)} gacha amal qiladi.` }).catch(() => {});
+      await say(id, `✅ Berildi: ${esc(req.name || "")} (ID ${req.uid}) — ${n} kun, ${fd(until)} gacha.`); return true;
+    }
+    if (t && t.st == "chek" && !adm || t && t.st == "chek" && adm) {
+      const k = m.photo ? "photo" : m.document ? "document" : m.video ? "video" : m.video_note ? "video" : "";
+      if (!k) { await say(id, "Chekni rasm, fayl yoki video qilib yuboring."); return true; }
+      await setSt(id, "izoh", { cm: m.message_id }); await say(id, "Adminga berilishi kerak bo'lgan tushuntirish bo'lsa yozing", [[{ text: "O'tkazib yuborish", callback_data: "skip" }]]); return true;
+    }
+    if (t && t.st == "izoh") { if (!text) { await say(id, "Matn yozing yoki «O'tkazib yuborish» ni bosing.", [[{ text: "O'tkazib yuborish", callback_data: "skip" }]]); return true; } await finishReq(id, t, text.slice(0, 600)); return true; }
+    if (!adm) { if (text && !text.startsWith("/start")) await say(id, "Obuna olish uchun ilovada Profil → «Obuna olish» tugmasini bosing."); else if (/^\/start/i.test(text)) await say(id, "Salom! 👋 AniManxwa botiga xush kelibsiz.\nObuna olish uchun ilovada Profil → «Obuna olish» tugmasini bosing."); return true; }
+    return false;
+  }
+  async function finishReq(id, t, comment) {
+    const rid = crypto.randomBytes(5).toString("hex"), d = t.uid ? await D.findOne({ _id: t.uid }) : null;
+    await PQ.insertOne({ _id: rid, tg: id, uid: t.uid || "", name: t.name || "", username: t.username || "", comment, status: "new", at: Date.now() });
+    await setSt(id, null);
+    await say(id, "Chekingiz qabul qilindi, 1-2 soatlarda hisobingizga obuna o'rnatib beriladi");
+    const cap = `🧾 Yangi chek\nFoydalanuvchi: ${t.name || "-"}${t.username ? " (@" + t.username + ")" : ""}\nTelegram ID: ${id}\nIlova ID: ${t.uid || "-"}\nHozirgi obuna: ${d && d.premium > Date.now() ? fd(d.premium) + " gacha" : "yo'q"}\nIzoh: ${comment || "-"}`;
+    const kb = { inline_keyboard: [[{ text: "Obuna berish", callback_data: "g:" + rid }, { text: "Bekor qilish", callback_data: "d:" + rid }]] };
+    for (const a of ADMINS) tg("copyMessage", { chat_id: a, from_chat_id: id, message_id: t.cm, caption: cap.slice(0, 1000), reply_markup: kb }).catch(e => { console.error("chek:", e.message); say(a, cap, kb.inline_keyboard); });
+  }
+
   async function handle(u) {
+    if (await payHandle(u).catch(e => (console.error("pay:", e), false))) return;
     if (u.callback_query) {
       const q = u.callback_query; tg("answerCallbackQuery", { callback_query_id: q.id }).catch(() => {});
       const id = q.message && q.message.chat.id; if (!id || !ADMINS.has(String(q.from.id))) return;
